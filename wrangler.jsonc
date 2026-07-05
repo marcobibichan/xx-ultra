@@ -1,0 +1,39 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "xx-ultra",
+  "main": "worker.js",
+  "compatibility_date": "2026-05-03",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  // <-- cloudflare:sockets 由 compatibility_date 自動啟用；不需要額外 flag
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CONTROL_PLANE_DO",
+        "class_name": "ControlPlaneDO"
+      }
+    ]
+  },
+  // 第一次部署時需要遷移宣告
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ControlPlaneDO"]
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.05
+  },
+  "routes": [
+    {
+      "pattern": "sub.example.com",
+      "zone_name": "example.com",
+      "custom_domain": true,
+      "enabled": true,
+      "previews_enabled": false
+    }
+  ],
+  "account_id": "your account id"
+}
