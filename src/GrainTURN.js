@@ -1,13 +1,12 @@
 // =============================================================================
 // xx-ultra — XHTTP XMUX 完全體 Worker (Cloudflare Workers)
-// UUID: 78f076f9-35f8-4847-8722-d44fe7942752  路徑: /bibichan  stream-one
+// UUID: 78f076f9-35f8-4847-8722-d44fe7942752  路徑: /bibichan
 // 全 TURN 出口: TCP RFC 6062 + UDP ChannelData 盲轉
 // ControlPlaneDO: 僅 auth handshake → 休眠
 // =============================================================================
 
 import { connect } from 'cloudflare:sockets';
 
-// ─── 常量 ───────────────────────────────────────────────────────────────────
 const CFG = {
   UUID: '78f076f9-35f8-4847-8722-d44fe7942752',
   PATH: '/bibichan',
@@ -103,10 +102,21 @@ const parseVLESS = (c) => {
   const addInfoLen = c[17];
   let o = 19 + addInfoLen;
   if (o + 3 > c.length) return null;
+  const cmd = c[o - 1];
   const port = (c[o] << 8) | c[o + 1];
   const atype = c[o + 2];
+
+  if (cmd === 0x03) {
+    return { cmd, port: 0, atype: 0, addr: '', dataOffset: o };
+  }
+  if (cmd === 0x02) {
+    const a = readAddrBody(c, o + 3, atype);
+    const addrEnd = a ? a.end : o + 3;
+    return { cmd, port, atype, addr: a ? a.addr : '', dataOffset: addrEnd };
+  }
+
   const a = readAddrBody(c, o + 3, atype);
-  return a ? { cmd: c[o - 1], port, atype, addr: a.addr, dataOffset: a.end } : null;
+  return a ? { cmd, port, atype, addr: a.addr, dataOffset: a.end } : null;
 };
 
 // ─── XMUX Frame 解析 ────────────────────────────────────────────────────────
@@ -124,6 +134,10 @@ const parseXMUXFrame = (b, o) => {
   const sid = (b[o + 2] << 8) | b[o + 3];
   const status = b[o + 4];
   const option = b[o + 5];
+
+  // ★ 驗證 status (1-4) 和 option (0-2)
+  if (status < 1 || status > 4) return null;
+  if (option > 2) return null;
 
   let target = null;
   let metaCursor = o + 6;
@@ -161,7 +175,6 @@ const parseXMUXFrame = (b, o) => {
   };
 };
 
-// ─── XMUX 下行幀構建 ────────────────────────────────────────────────────────
 const buildXMUXKeepFrame = (sid, data) => {
   const metaLen = 4;
   const dLen = data.byteLength;
@@ -199,10 +212,9 @@ const resolveIP = async h =>
     headers: { Accept: 'application/dns-json' }
   }).then(r => r.json()).catch(() => ({}))).Answer?.find(a => a.type === 1)?.data ?? null;
 
-// ─── VLESS Response Header ──────────────────────────────────────────────────
 const vlessResp = new Uint8Array([0, 0]);
 
-// ─── GrainTCP 聚合隊列 ──────────────────────────────────────────────────────
+// ─── GrainTCP ────────────────────────────────────────────────────────────────
 const mkGrainTCP = (cap = CFG.DN_PACK, tail = CFG.DN_TAIL, low = Math.max(4096, tail << 3)) => {
   let pb = new Uint8Array(cap), p = 0, tp = 0, mq = 0, gen = 0, qk = 0, qr = 0;
   let writer = null;
@@ -252,7 +264,7 @@ const mkGrainTCP = (cap = CFG.DN_PACK, tail = CFG.DN_TAIL, low = Math.max(4096, 
   };
 };
 
-// ─── STUN / TURN 協議常量 ───────────────────────────────────────────────────
+// ─── STUN / TURN ────────────────────────────────────────────────────────────
 const MAGIC = new Uint8Array([0x21, 0x12, 0xA4, 0x42]);
 const MT = { AQ: 0x003, AO: 0x103, AE: 0x113, PQ: 0x008, PO: 0x108, CQ: 0x00A, CO: 0x10A, BQ: 0x00B, BO: 0x10B, SI: 0x016, DI: 0x017 };
 const AT = { USER: 0x006, MI: 0x008, ERR: 0x009, PEER: 0x012, DATA: 0x013, REALM: 0x014, NONCE: 0x015, TRANSPORT: 0x019, CONNID: 0x02A };
@@ -297,7 +309,7 @@ const readStun = async (rd, buf) => {
   } catch { return [null, null]; }
 };
 
-// ─── TURN 認證 (純 handshake) ───────────────────────────────────────────────
+// ─── TURN 認證 ─────────────────────────────────────────────────────────────
 const turnAuthHandshake = async (w, r, transport, { user, pass }) => {
   const tp = new Uint8Array([transport, 0, 0, 0]);
   await w.write(stunMsg(MT.AQ, tid(), [stunAttr(AT.TRANSPORT, tp)]));
@@ -308,7 +320,7 @@ const turnAuthHandshake = async (w, r, transport, { user, pass }) => {
   if (msg.type === MT.AE && parseErr(msg.attrs[AT.ERR]) === 401) {
     const realm = td.decode(msg.attrs[AT.REALM] ?? new Uint8Array(0));
     const nonce = msg.attrs[AT.NONCE] ?? new Uint8Array(0);
-    if (user && pass) key = await md5(`${user}:${realm}:${pass}`);
+    if (user && pass) key = await md5(`$bibichan:${realm}:${pass}`);
     aa = [
       stunAttr(AT.USER, te.encode(user || '')),
       stunAttr(AT.REALM, te.encode(realm)),
@@ -320,7 +332,7 @@ const turnAuthHandshake = async (w, r, transport, { user, pass }) => {
   return msg.type === MT.AO ? { key, aa, ex, sign } : null;
 };
 
-// ─── ControlPlaneDO (僅 auth handshake, 做完即休眠) ────────────────────────
+// ─── ControlPlaneDO ────────────────────────────────────────────────────────
 export class ControlPlaneDO {
   constructor(state, env) {
     this.state = state;
@@ -336,7 +348,7 @@ export class ControlPlaneDO {
     if (url.pathname !== '/turnAuth') return new Response('Not Found', { status: 404 });
 
     const { host, port, user, pass, transport } = await request.json();
-    const cacheKey = `${host}:${port}:${user}:${transport}`;
+    const cacheKey = `${host}:${port}:$bibichan:${transport}`;
     const cached = this.doCache.get(cacheKey);
     if (cached && cached.expiry > Date.now()) {
       return new Response(JSON.stringify(cached.state), { headers: { 'Content-Type': 'application/json' } });
@@ -366,13 +378,13 @@ export class ControlPlaneDO {
   }
 }
 
-// ─── Worker 全域 L1 Cache ───────────────────────────────────────────────────
+// ─── Worker L1 Cache ────────────────────────────────────────────────────────
 const workerTurnCache = new Map();
 
 const getTurnAuthState = async (env, turnCfg, transport) => {
   if (!turnCfg?.host) return null;
   const { host, port, user, pass } = turnCfg;
-  const cacheKey = `${host}:${port}:${user}:${transport}`;
+  const cacheKey = `${host}:${port}:$bibichan:${transport}`;
 
   const l1 = workerTurnCache.get(cacheKey);
   if (l1 && l1.expiry > Date.now()) return l1.state;
@@ -405,11 +417,12 @@ const getTurnAuthState = async (env, turnCfg, transport) => {
   return null;
 };
 
-// ─── TURN UDP Pool (transport=17, 一條持久連線) ────────────────────────────
+// ─── TURN UDP Pool ─────────────────────────────────────────────────────────
 const createTURNUDPPool = async (turnCfg, env) => {
   const { host, port, user, pass } = turnCfg;
+  
   const authState = await getTurnAuthState(env, turnCfg, 17);
-  if (!authState) return null;
+  if (!authState) {  return null; }
 
   const key = authState.key ? new Uint8Array(authState.key) : null;
   const aa = authState.aa.map(a => new Uint8Array(a));
@@ -417,6 +430,7 @@ const createTURNUDPPool = async (turnCfg, env) => {
 
   let ctrl = null, cw = null, cr = null;
   try {
+    
     ctrl = await dial(host, port);
     cw = ctrl.writable.getWriter();
     cr = ctrl.readable.getReader();
@@ -426,6 +440,7 @@ const createTURNUDPPool = async (turnCfg, env) => {
     ])));
     const [udpAlloc, udpEx] = await readStun(cr);
     if (!udpAlloc || udpAlloc.type !== MT.AO) {
+      
       cw.releaseLock(); cr.releaseLock();
       try { ctrl.close(); } catch {}
       return null;
@@ -438,27 +453,32 @@ const createTURNUDPPool = async (turnCfg, env) => {
     const close = () => {
       if (closed) return;
       closed = true;
+      
       try { cw.releaseLock(); } catch {}
       try { cr.releaseLock(); } catch {}
       try { ctrl?.close(); } catch {}
     };
 
     (async () => {
+      
       try {
         while (!closed) {
           const [msg, nx] = await readStun(cr, ctrlBuf);
           ctrlBuf = nx;
-          if (!msg) break;
+          if (!msg) {  break; }
           if (msg.type === MT.DI && msg.attrs[AT.PEER] && msg.attrs[AT.DATA] && onUDPData) {
             const [ip, pt] = parseXorPeer(msg.attrs[AT.PEER]);
+            
             onUDPData(ip, pt, msg.attrs[AT.DATA]);
           }
         }
-      } catch {}
+      } catch (e) {  }
+      
     })().catch(() => {});
 
     const udpSend = (targetIp, targetPort, data) => {
-      if (closed) return;
+      if (closed) {  return; }
+      
       cw.write(stunMsg(MT.SI, tid(), [
         stunAttr(AT.PEER, xorPeer(targetIp, targetPort)),
         stunAttr(AT.DATA, data),
@@ -466,6 +486,7 @@ const createTURNUDPPool = async (turnCfg, env) => {
     };
 
     const ensurePerm = (ip) => {
+      
       sign(stunMsg(MT.PQ, tid(), [stunAttr(AT.PEER, xorPeer(ip, 0)), ...aa]))
         .then(m => cw.write(m).catch(() => {}));
     };
@@ -474,6 +495,7 @@ const createTURNUDPPool = async (turnCfg, env) => {
 
     return { udpSend, ensurePerm, setUDPHandler, close };
   } catch (e) {
+    
     try { cw?.releaseLock(); } catch {}
     try { cr?.releaseLock(); } catch {}
     try { ctrl?.close(); } catch {}
@@ -481,11 +503,12 @@ const createTURNUDPPool = async (turnCfg, env) => {
   }
 };
 
-// ─── TURN TCP Session Factory (transport=6, 每個 session 獨立連線) ─────────
+// ─── TURN TCP Session Factory ──────────────────────────────────────────────
 const createTURNTCPConnection = async (turnCfg, env, targetIp, targetPort) => {
   const { host, port, user, pass } = turnCfg;
+  
   const authState = await getTurnAuthState(env, turnCfg, 6);
-  if (!authState) return null;
+  if (!authState) {  return null; }
 
   const key = authState.key ? new Uint8Array(authState.key) : null;
   const aa = authState.aa.map(a => new Uint8Array(a));
@@ -494,6 +517,7 @@ const createTURNTCPConnection = async (turnCfg, env, targetIp, targetPort) => {
   let ctrl = null, dataSock = null;
   let cw = null, cr = null, dr = null;
   try {
+    
     ctrl = await dial(host, port);
     cw = ctrl.writable.getWriter();
     cr = ctrl.readable.getReader();
@@ -503,12 +527,14 @@ const createTURNTCPConnection = async (turnCfg, env, targetIp, targetPort) => {
     ])));
     const [allocResp, allocEx] = await readStun(cr);
     if (!allocResp || allocResp.type !== MT.AO) {
+      
       cw.releaseLock(); cr.releaseLock();
       try { ctrl.close(); } catch {}
       return null;
     }
 
     const peer = stunAttr(AT.PEER, xorPeer(targetIp, targetPort));
+    
     await cw.write(cat(
       await sign(stunMsg(MT.PQ, tid(), [peer, ...aa])),
       await sign(stunMsg(MT.CQ, tid(), [peer, ...aa]))
@@ -516,6 +542,7 @@ const createTURNTCPConnection = async (turnCfg, env, targetIp, targetPort) => {
 
     let [msg, buf] = await readStun(cr, allocEx);
     if (!msg || msg.type !== MT.PO) {
+      
       cw.releaseLock(); cr.releaseLock();
       try { ctrl.close(); } catch {}
       return null;
@@ -523,6 +550,7 @@ const createTURNTCPConnection = async (turnCfg, env, targetIp, targetPort) => {
 
     [msg, buf] = await readStun(cr, buf);
     if (!msg || msg.type !== MT.CO || !msg.attrs[AT.CONNID]) {
+      
       cw.releaseLock(); cr.releaseLock();
       try { ctrl.close(); } catch {}
       return null;
@@ -540,6 +568,7 @@ const createTURNTCPConnection = async (turnCfg, env, targetIp, targetPort) => {
 
     const [bindResp, bindExtra] = await readStun(dr);
     if (!bindResp || bindResp.type !== MT.BO) {
+      
       dw.releaseLock(); dr.releaseLock();
       try { dataSock.close(); } catch {}
       cw.releaseLock(); cr.releaseLock();
@@ -547,10 +576,8 @@ const createTURNTCPConnection = async (turnCfg, env, targetIp, targetPort) => {
       return null;
     }
 
-    cw.releaseLock();
-    cr.releaseLock();
-    cw = null;
-    cr = null;
+    cw.releaseLock(); cr.releaseLock();
+    cw = null; cr = null;
 
     dw.releaseLock();
     const grain = mkGrainTCP();
@@ -569,10 +596,9 @@ const createTURNTCPConnection = async (turnCfg, env, targetIp, targetPort) => {
     });
 
     return {
-      readable,
-      writable: dataSock.writable,
-      grain,
+      readable, writable: dataSock.writable, grain,
       close: () => {
+        
         try { grain.close(); } catch {}
         try { writer.releaseLock(); } catch {}
         try { dr.releaseLock(); } catch {}
@@ -581,6 +607,7 @@ const createTURNTCPConnection = async (turnCfg, env, targetIp, targetPort) => {
       },
     };
   } catch (e) {
+    
     try { cw?.releaseLock(); } catch {}
     try { cr?.releaseLock(); } catch {}
     try { dr?.releaseLock(); } catch {}
@@ -591,21 +618,41 @@ const createTURNTCPConnection = async (turnCfg, env, targetIp, targetPort) => {
 };
 
 // ─── XUDP 輔助 ──────────────────────────────────────────────────────────────
-const fakeIPType = h => {
-  const m = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
-  return m && +m[1] === 198 && [18, 19].includes(+m[2]) ? 4 : h.replace(/^\[|\]$/g, '').startsWith('fc') && h.includes(':') ? 6 : 0;
-};
-
 const parseXUDP = d => {
   if (d.length < 6) return null;
   const metaLen = u16(d), metaEnd = 2 + metaLen;
   if (metaLen < 4 || metaEnd > d.length) return null;
-  const f = { network: metaEnd > 6 ? d[6] : 0, port: metaEnd >= 9 ? u16(d, 7) : 0, host: metaEnd > 9 ? xudpAddr(d.subarray(9, metaEnd))[0] : '', payload: null, totalLen: metaEnd };
-  if ((d[5] & 1) && metaEnd + 2 <= d.length) {
-    const pLen = u16(d, metaEnd);
-    if (metaEnd + 2 + pLen <= d.length) { f.payload = d.subarray(metaEnd + 2, metaEnd + 2 + pLen); f.totalLen = metaEnd + 2 + pLen; }
+
+  const status = d[4];
+  const option = d[5];
+  const network = metaEnd > 6 ? d[6] : 0;
+  const port = metaEnd >= 9 ? u16(d, 7) : 0;
+  const addrStart = 9;
+
+  let host = '';
+  let addrEnd = addrStart;
+  if (metaEnd > addrStart) {
+    const a = xudpAddr(d.subarray(addrStart, metaEnd));
+    host = a[0];
+    addrEnd = addrStart + a[1];
   }
-  return f;
+
+  let globalID = null;
+  if (status === SESS_NEW && addrEnd + 8 <= metaEnd) {
+    globalID = d.subarray(addrEnd, addrEnd + 8);
+  }
+
+  let payload = null;
+  let totalLen = metaEnd;
+  if ((option & OPT_DATA) && metaEnd + 2 <= d.length) {
+    const pLen = u16(d, metaEnd);
+    if (metaEnd + 2 + pLen <= d.length) {
+      payload = d.subarray(metaEnd + 2, metaEnd + 2 + pLen);
+      totalLen = metaEnd + 2 + pLen;
+    }
+  }
+
+  return { status, option, network, host, port, globalID, payload, totalLen };
 };
 
 const xudpAddr = d => {
@@ -675,10 +722,11 @@ const createSessionManager = (controller, turnCfg, env, udpPool, isStreamOne) =>
 
   const newTCPSession = async (sid, host, port) => {
     closeSession(sid);
+    
     const resolved = await resolveIP(host);
-    if (!resolved) return;
+    if (!resolved) {  return; }
     const tcpConn = await createTURNTCPConnection(turnCfg, env, resolved, port);
-    if (!tcpConn) return;
+    if (!tcpConn) {  return; }
 
     const grain = tcpConn.grain;
     const sock = {
@@ -700,19 +748,26 @@ const createSessionManager = (controller, turnCfg, env, udpPool, isStreamOne) =>
           if (!value?.byteLength) continue;
           downWrite(sid, new Uint8Array(value));
         }
-      } catch {} finally {
+      } catch (e) {  } finally {
         try { reader.releaseLock(); } catch {}
         closeSession(sid);
+        
       }
     })().catch(() => {});
   };
 
   const ensureUDPSession = async (sid, host, port) => {
-    if (udpMap.has(sid)) return udpMap.get(sid);
+    if (udpMap.has(sid)) {
+      
+      return udpMap.get(sid);
+    }
+    
     const resolved = await resolveIP(host);
+    
     if (!resolved) return null;
     const s = { host, port, ip: resolved };
     udpMap.set(sid, s);
+    
     udpPool?.ensurePerm(resolved);
     return s;
   };
@@ -722,48 +777,71 @@ const createSessionManager = (controller, turnCfg, env, udpPool, isStreamOne) =>
 
     switch (status) {
       case SESS_NEW: {
-        if (!target) return;
+        if (!target) {  return; }
+
         if (target.net === NET_TCP) {
           await newTCPSession(sid, target.host, target.port);
         } else if (target.net === NET_UDP) {
+          
           await ensureUDPSession(sid, target.host, target.port);
           sessions.set(sid, { net: NET_UDP, target, alive: Date.now(), grain: null, writer: null, sock: null });
+          
         }
         if (data && (option & OPT_DATA)) {
           const s = sessions.get(sid);
-          if (s?.grain) s.grain.send(data);
-        }
-        break;
-      }
-      case SESS_KEEP: {
-        const s = sessions.get(sid);
-        if (!s) return;
-        s.alive = Date.now();
-        if (data && (option & OPT_DATA)) {
-          if (s.net === NET_TCP && s.grain) {
+          if (s?.grain) {
             s.grain.send(data);
-          } else if (s.net === NET_UDP && udpPool) {
+          } else if (s?.net === NET_UDP && udpPool) {
+            
             const us = udpMap.get(sid);
             if (us) {
-              let xd = data;
-              while (xd.length >= 6) {
-                const f = parseXUDP(xd);
-                if (!f) break;
-                if (f.payload?.length && f.host) {
-                  udpPool.udpSend(us.ip || f.host, f.port, f.payload);
-                }
-                xd = xd.subarray(f.totalLen);
-              }
+let xd = data;
+               while (xd.length >= 6) {
+                 const f = parseXUDP(xd);
+                 if (!f) break;
+                 if (f.payload?.length && f.host) {
+                   const sendIP = us.ip || await resolveIP(f.host);
+                   if (sendIP) { udpPool.ensurePerm(sendIP); udpPool.udpSend(sendIP, f.port, f.payload); }
+                 }
+                 xd = xd.subarray(f.totalLen);
+               }
+             }
+           }
+         }
+         break;
+       }
+       case SESS_KEEP: {
+         const s = sessions.get(sid);
+         if (!s) {  return; }
+         s.alive = Date.now();
+         if (data && (option & OPT_DATA)) {
+           if (s.net === NET_TCP && s.grain) {
+             s.grain.send(data);
+           } else if (s.net === NET_UDP && udpPool) {
+             
+             const us = udpMap.get(sid);
+             if (us) {
+               let xd = data;
+               while (xd.length >= 6) {
+                 const f = parseXUDP(xd);
+                 if (!f) break;
+                 if (f.payload?.length && f.host) {
+                   const sendIP = us.ip || await resolveIP(f.host);
+                   if (sendIP) { udpPool.ensurePerm(sendIP); udpPool.udpSend(sendIP, f.port, f.payload); }
+                 }
+                 xd = xd.subarray(f.totalLen);
+               }
             }
           }
         }
         if (target && target.net === NET_UDP && s.net === NET_UDP) {
           s.target = target;
-          ensureUDPSession(sid, target.host, target.port);
+          await ensureUDPSession(sid, target.host, target.port);
         }
         break;
       }
       case SESS_END:
+        
         closeSession(sid);
         break;
       case SESS_KEEPALIVE: {
@@ -778,6 +856,7 @@ const createSessionManager = (controller, turnCfg, env, udpPool, isStreamOne) =>
     const now = Date.now();
     for (const [sid, s] of sessions) {
       if (now - s.alive > CFG.SESSION_IDLE_MS) {
+        
         closeSession(sid);
       }
     }
@@ -828,7 +907,9 @@ export default {
     }
 
     const addInfoLen = cache[17];
-    const addrTypeOff = 18 + addInfoLen + 1 + 2;
+    const cmdOff = 18 + addInfoLen;
+    const portOff = cmdOff + 1;
+    const addrTypeOff = portOff + 2;
     const addrBodyOff = addrTypeOff + 1;
 
     while (cache.length <= addrTypeOff) {
@@ -842,8 +923,13 @@ export default {
     }
 
     const atype = cache[addrTypeOff];
+    const cmdPreview = cache[cmdOff];
+
     let needBytes;
-    if (atype === ATYPE_IPV4) {
+    if (cmdPreview === 0x03) {
+      
+      needBytes = addrTypeOff;
+    } else if (atype === ATYPE_IPV4) {
       needBytes = addrBodyOff + 4;
     } else if (atype === ATYPE_IPV6) {
       needBytes = addrBodyOff + 16;
@@ -860,8 +946,9 @@ export default {
       const domainLen = cache[addrBodyOff];
       needBytes = addrBodyOff + 1 + domainLen;
     } else {
-      try { reader.releaseLock(); } catch {}
-      return new Response('Unknown address type', { status: 422 });
+      // UDP: atype 可能是 0/4/5/255，全部放行
+      
+      needBytes = addrBodyOff;
     }
 
     while (cache.length < needBytes) {
@@ -882,9 +969,83 @@ export default {
 
     const remaining = cache.subarray(vless.dataOffset);
     const vlessTarget = { cmd: vless.cmd, host: vless.addr, port: vless.port, atype: vless.atype };
-    const isStreamOne = vlessTarget.cmd === 0x01;
 
-    // ── Phase 2+3: 立即返回 Response，非同步初始化 TURN Pool ──
+    // ── UDP 專用路徑 (cmd=0x02 / cmd=0x03 both XUDP in XMUX stack) ────
+    if (vlessTarget.cmd === 0x02 || vlessTarget.cmd === 0x03) {
+
+      let xd = remaining;
+
+      let udpPoolRef = null;
+
+      const responseStream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(vlessResp);
+
+          ctx.waitUntil((async () => {
+            try {
+              const pool = await createTURNUDPPool(turnCfg, env);
+              if (!pool) { controller.error(new Error('TURN UDP pool init failed')); return; }
+              udpPoolRef = pool;
+
+              pool.setUDPHandler((ip, port, data) => {
+                
+                try { controller.enqueue(xudpResp(ip, port, data)); } catch {}
+              });
+
+              const sendFrame = async (f) => {
+                if (f.payload?.length && f.host) {
+                  const resolved = await resolveIP(f.host);
+                  if (resolved) { pool.ensurePerm(resolved); pool.udpSend(resolved, f.port, f.payload); }
+                }
+              };
+
+              const processXUDPChunk = async (chunk) => {
+                while (chunk.length >= 6) {
+                  const f = parseXUDP(chunk);
+                  if (!f) {
+                    
+                    break;
+                  }
+                  await sendFrame(f);
+                  chunk = chunk.subarray(f.totalLen);
+                }
+              };
+
+              await processXUDPChunk(xd);
+
+              for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (value) await processXUDPChunk(toU8(value));
+              }
+            } catch (e) {  } finally {
+              
+              try { reader.releaseLock(); } catch {}
+              udpPoolRef?.close();
+            }
+          })().catch(() => {}));
+        },
+        cancel() {
+          
+          try { reader.releaseLock(); } catch {}
+          udpPoolRef?.close();
+        },
+      });
+
+      return new Response(responseStream, {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'X-Accel-Buffering': 'no',
+          'Connection': 'keep-alive',
+          'User-Agent': 'Go-http-client/2.0',
+        },
+      });
+    }
+
+    // ── TCP / XMUX 路徑 (cmd=0x01) ──────────────────────────────────────
+    const isStreamOne = vlessTarget.cmd === 0x01;
     let sm = null;
     let udpPool = null;
 
@@ -901,7 +1062,9 @@ export default {
           while (c.length >= 4) {
             const frame = parseXMUXFrame(c, 0);
             if (!frame) {
+              
               if (vlessTgt && vlessTgt.cmd === 0x01 && c.length > 0) {
+                
                 if (!smRef.sessions.has(0)) {
                   await smRef.handleFrame({
                     sid: 0, status: SESS_NEW, option: OPT_DATA,
@@ -910,22 +1073,28 @@ export default {
                   });
                 }
                 const s = smRef.sessions.get(0);
-                if (s?.grain) s.grain.send(c);
+                if (s?.grain) { s.grain.send(c);  }
                 return;
               }
               uploadBuffer = c;
               return;
             }
+            
             await smRef.handleFrame(frame);
             c = c.subarray(frame.frameEnd);
           }
-          if (c.length > 0) uploadBuffer = c;
+          if (c.length > 0) {
+            
+            uploadBuffer = c;
+          }
         };
 
         ctx.waitUntil((async () => {
           try {
+            
             udpPool = await createTURNUDPPool(turnCfg, env);
             if (!udpPool) {
+              
               controller.error(new Error('TURN UDP pool init failed'));
               return;
             }
@@ -933,12 +1102,15 @@ export default {
             sm = createSessionManager(controller, turnCfg, env, udpPool, isStreamOne);
 
             udpPool.setUDPHandler((ip, port, data) => {
+              
               for (const [sid, us] of sm.udpMap) {
                 if (us.ip === ip && us.port === port) {
+                  
                   sm.downWrite(sid, xudpResp(us.host, us.port, data));
                   return;
                 }
               }
+              
               sm.downWrite(0, xudpResp(ip, port, data));
             });
 
@@ -946,13 +1118,14 @@ export default {
 
             for (;;) {
               const { done, value } = await reader.read();
-              if (done) break;
+              if (done) {  break; }
               if (value) {
                 const chunk = toU8(value);
                 if (chunk.byteLength) await processFrames(chunk, sm, vlessTarget);
               }
             }
-          } catch {} finally {
+          } catch (e) {  } finally {
+            
             try { reader.releaseLock(); } catch {}
             sm?.closeAll();
             udpPool?.close();
@@ -962,6 +1135,7 @@ export default {
       },
 
       cancel() {
+        
         try { reader.releaseLock(); } catch {}
         sm?.closeAll();
         udpPool?.close();
