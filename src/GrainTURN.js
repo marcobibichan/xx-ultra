@@ -11,10 +11,10 @@ const CFG = {
   UUID: '78f076f9-35f8-4847-8722-d44fe7942752',
   PATH: '/bibichan',
   CHUNK: 64 * 1024,
-  DN_PACK: 32 * 1024,
+  DN_PACK: 64 * 1024,
   DN_TAIL: 512,
-  DN_MS: 0,
-  CONCUR: 4,
+  DN_MS: 8,
+  CONCUR: 6,
   MAX_SESSIONS: 128,
   SESSION_IDLE_MS: 30_000,
   MUX_METALEN_MAX: 512,
@@ -420,9 +420,8 @@ const getTurnAuthState = async (env, turnCfg, transport) => {
 // ─── TURN UDP Pool ─────────────────────────────────────────────────────────
 const createTURNUDPPool = async (turnCfg, env) => {
   const { host, port, user, pass } = turnCfg;
-  
   const authState = await getTurnAuthState(env, turnCfg, 17);
-  if (!authState) {  return null; }
+  if (!authState) { return null; }
 
   const key = authState.key ? new Uint8Array(authState.key) : null;
   const aa = authState.aa.map(a => new Uint8Array(a));
@@ -430,7 +429,6 @@ const createTURNUDPPool = async (turnCfg, env) => {
 
   let ctrl = null, cw = null, cr = null;
   try {
-    
     ctrl = await dial(host, port);
     cw = ctrl.writable.getWriter();
     cr = ctrl.readable.getReader();
@@ -440,7 +438,6 @@ const createTURNUDPPool = async (turnCfg, env) => {
     ])));
     const [udpAlloc, udpEx] = await readStun(cr);
     if (!udpAlloc || udpAlloc.type !== MT.AO) {
-      
       cw.releaseLock(); cr.releaseLock();
       try { ctrl.close(); } catch {}
       return null;
@@ -449,53 +446,65 @@ const createTURNUDPPool = async (turnCfg, env) => {
     let closed = false;
     let ctrlBuf = udpEx;
     let onUDPData = null;
+    const perms = new Set();
+    const permQueue = [];
 
     const close = () => {
       if (closed) return;
       closed = true;
-      
       try { cw.releaseLock(); } catch {}
       try { cr.releaseLock(); } catch {}
       try { ctrl?.close(); } catch {}
     };
 
     (async () => {
-      
       try {
         while (!closed) {
           const [msg, nx] = await readStun(cr, ctrlBuf);
           ctrlBuf = nx;
-          if (!msg) {  break; }
+          if (!msg) { break; }
           if (msg.type === MT.DI && msg.attrs[AT.PEER] && msg.attrs[AT.DATA] && onUDPData) {
             const [ip, pt] = parseXorPeer(msg.attrs[AT.PEER]);
-            
             onUDPData(ip, pt, msg.attrs[AT.DATA]);
+          } else if (msg.type === MT.PO) {
+            const r = permQueue.shift();
+            if (r) r.resolve();
+          } else if (msg.type === MT.AE && msg.attrs[AT.ERR]) {
+            const errCode = parseErr(msg.attrs[AT.ERR]);
+            const r = permQueue.shift();
+            if (r) r.reject(new Error(`TURN error ${errCode}`));
           }
         }
-      } catch (e) {  }
-      
+      } catch (e) {}
     })().catch(() => {});
 
     const udpSend = (targetIp, targetPort, data) => {
-      if (closed) {  return; }
-      
+      if (closed) { return; }
       cw.write(stunMsg(MT.SI, tid(), [
         stunAttr(AT.PEER, xorPeer(targetIp, targetPort)),
         stunAttr(AT.DATA, data),
       ])).catch(() => {});
     };
 
-    const ensurePerm = (ip) => {
-      
-      sign(stunMsg(MT.PQ, tid(), [stunAttr(AT.PEER, xorPeer(ip, 0)), ...aa]))
-        .then(m => cw.write(m).catch(() => {}));
+    const ensurePerm = async (ip) => {
+      if (perms.has(ip)) { return; }
+      perms.add(ip);
+      let resolve, reject;
+      const p = new Promise((res, rej) => { resolve = res; reject = rej; });
+      permQueue.push({ resolve, reject });
+      const m = await sign(stunMsg(MT.PQ, tid(), [stunAttr(AT.PEER, xorPeer(ip, 0)), ...aa]));
+      try {
+        await cw.write(m);
+        await p;
+      } catch (e) {
+        perms.delete(ip);
+      }
     };
 
     const setUDPHandler = (handler) => { onUDPData = handler; };
 
     return { udpSend, ensurePerm, setUDPHandler, close };
   } catch (e) {
-    
     try { cw?.releaseLock(); } catch {}
     try { cr?.releaseLock(); } catch {}
     try { ctrl?.close(); } catch {}
@@ -644,12 +653,12 @@ const parseXUDP = d => {
 
   let payload = null;
   let totalLen = metaEnd;
-  if ((option & OPT_DATA) && metaEnd + 2 <= d.length) {
+  if (option & OPT_DATA) {
+    if (metaEnd + 2 > d.length) return null;
     const pLen = u16(d, metaEnd);
-    if (metaEnd + 2 + pLen <= d.length) {
-      payload = d.subarray(metaEnd + 2, metaEnd + 2 + pLen);
-      totalLen = metaEnd + 2 + pLen;
-    }
+    if (metaEnd + 2 + pLen > d.length) return null;
+    payload = d.subarray(metaEnd + 2, metaEnd + 2 + pLen);
+    totalLen = metaEnd + 2 + pLen;
   }
 
   return { status, option, network, host, port, globalID, payload, totalLen };
@@ -722,11 +731,10 @@ const createSessionManager = (controller, turnCfg, env, udpPool, isStreamOne) =>
 
   const newTCPSession = async (sid, host, port) => {
     closeSession(sid);
-    
     const resolved = await resolveIP(host);
-    if (!resolved) {  return; }
+    if (!resolved) { return; }
     const tcpConn = await createTURNTCPConnection(turnCfg, env, resolved, port);
-    if (!tcpConn) {  return; }
+    if (!tcpConn) { return; }
 
     const grain = tcpConn.grain;
     const sock = {
@@ -748,27 +756,22 @@ const createSessionManager = (controller, turnCfg, env, udpPool, isStreamOne) =>
           if (!value?.byteLength) continue;
           downWrite(sid, new Uint8Array(value));
         }
-      } catch (e) {  } finally {
+      } catch (e) {} finally {
         try { reader.releaseLock(); } catch {}
         closeSession(sid);
-        
       }
     })().catch(() => {});
   };
 
   const ensureUDPSession = async (sid, host, port) => {
     if (udpMap.has(sid)) {
-      
       return udpMap.get(sid);
     }
-    
     const resolved = await resolveIP(host);
-    
     if (!resolved) return null;
     const s = { host, port, ip: resolved };
     udpMap.set(sid, s);
-    
-    udpPool?.ensurePerm(resolved);
+    await udpPool?.ensurePerm(resolved);
     return s;
   };
 
@@ -777,60 +780,56 @@ const createSessionManager = (controller, turnCfg, env, udpPool, isStreamOne) =>
 
     switch (status) {
       case SESS_NEW: {
-        if (!target) {  return; }
+        if (!target) { return; }
 
         if (target.net === NET_TCP) {
           await newTCPSession(sid, target.host, target.port);
         } else if (target.net === NET_UDP) {
-          
           await ensureUDPSession(sid, target.host, target.port);
           sessions.set(sid, { net: NET_UDP, target, alive: Date.now(), grain: null, writer: null, sock: null });
-          
         }
         if (data && (option & OPT_DATA)) {
           const s = sessions.get(sid);
           if (s?.grain) {
             s.grain.send(data);
           } else if (s?.net === NET_UDP && udpPool) {
-            
             const us = udpMap.get(sid);
             if (us) {
-let xd = data;
-               while (xd.length >= 6) {
-                 const f = parseXUDP(xd);
-                 if (!f) break;
-                 if (f.payload?.length && f.host) {
-                   const sendIP = us.ip || await resolveIP(f.host);
-                   if (sendIP) { udpPool.ensurePerm(sendIP); udpPool.udpSend(sendIP, f.port, f.payload); }
-                 }
-                 xd = xd.subarray(f.totalLen);
-               }
-             }
-           }
-         }
-         break;
-       }
-       case SESS_KEEP: {
-         const s = sessions.get(sid);
-         if (!s) {  return; }
-         s.alive = Date.now();
-         if (data && (option & OPT_DATA)) {
-           if (s.net === NET_TCP && s.grain) {
-             s.grain.send(data);
-           } else if (s.net === NET_UDP && udpPool) {
-             
-             const us = udpMap.get(sid);
-             if (us) {
-               let xd = data;
-               while (xd.length >= 6) {
-                 const f = parseXUDP(xd);
-                 if (!f) break;
-                 if (f.payload?.length && f.host) {
-                   const sendIP = us.ip || await resolveIP(f.host);
-                   if (sendIP) { udpPool.ensurePerm(sendIP); udpPool.udpSend(sendIP, f.port, f.payload); }
-                 }
-                 xd = xd.subarray(f.totalLen);
-               }
+              let xd = data;
+              while (xd.length >= 6) {
+                const f = parseXUDP(xd);
+                if (!f) break;
+                if (f.payload?.length && f.host) {
+                  const sendIP = us.ip || await resolveIP(f.host);
+                  if (sendIP) { await udpPool.ensurePerm(sendIP); udpPool.udpSend(sendIP, f.port, f.payload); }
+                }
+                xd = xd.subarray(f.totalLen);
+              }
+            }
+          }
+        }
+        break;
+      }
+      case SESS_KEEP: {
+        const s = sessions.get(sid);
+        if (!s) { return; }
+        s.alive = Date.now();
+        if (data && (option & OPT_DATA)) {
+          if (s.net === NET_TCP && s.grain) {
+            s.grain.send(data);
+          } else if (s.net === NET_UDP && udpPool) {
+            const us = udpMap.get(sid);
+            if (us) {
+              let xd = data;
+              while (xd.length >= 6) {
+                const f = parseXUDP(xd);
+                if (!f) break;
+                if (f.payload?.length && f.host) {
+                  const sendIP = us.ip || await resolveIP(f.host);
+                  if (sendIP) { await udpPool.ensurePerm(sendIP); udpPool.udpSend(sendIP, f.port, f.payload); }
+                }
+                xd = xd.subarray(f.totalLen);
+              }
             }
           }
         }
@@ -841,7 +840,6 @@ let xd = data;
         break;
       }
       case SESS_END:
-        
         closeSession(sid);
         break;
       case SESS_KEEPALIVE: {
@@ -927,7 +925,6 @@ export default {
 
     let needBytes;
     if (cmdPreview === 0x03) {
-      
       needBytes = addrTypeOff;
     } else if (atype === ATYPE_IPV4) {
       needBytes = addrBodyOff + 4;
@@ -972,7 +969,6 @@ export default {
 
     // ── UDP 專用路徑 (cmd=0x02 / cmd=0x03 both XUDP in XMUX stack) ────
     if (vlessTarget.cmd === 0x02 || vlessTarget.cmd === 0x03) {
-
       let xd = remaining;
 
       let udpPoolRef = null;
@@ -988,26 +984,33 @@ export default {
               udpPoolRef = pool;
 
               pool.setUDPHandler((ip, port, data) => {
-                
                 try { controller.enqueue(xudpResp(ip, port, data)); } catch {}
               });
 
               const sendFrame = async (f) => {
                 if (f.payload?.length && f.host) {
                   const resolved = await resolveIP(f.host);
-                  if (resolved) { pool.ensurePerm(resolved); pool.udpSend(resolved, f.port, f.payload); }
+                  if (resolved) { await pool.ensurePerm(resolved); pool.udpSend(resolved, f.port, f.payload); }
                 }
               };
 
+              let uploadBuffer = new Uint8Array(0);
+
               const processXUDPChunk = async (chunk) => {
-                while (chunk.length >= 6) {
-                  const f = parseXUDP(chunk);
+                let c = cat(uploadBuffer, chunk);
+                uploadBuffer = new Uint8Array(0);
+
+                while (c.length >= 6) {
+                  const f = parseXUDP(c);
                   if (!f) {
-                    
-                    break;
+                    uploadBuffer = c;
+                    return;
                   }
                   await sendFrame(f);
-                  chunk = chunk.subarray(f.totalLen);
+                  c = c.subarray(f.totalLen);
+                }
+                if (c.length > 0) {
+                  uploadBuffer = c;
                 }
               };
 
@@ -1062,9 +1065,7 @@ export default {
           while (c.length >= 4) {
             const frame = parseXMUXFrame(c, 0);
             if (!frame) {
-              
               if (vlessTgt && vlessTgt.cmd === 0x01 && c.length > 0) {
-                
                 if (!smRef.sessions.has(0)) {
                   await smRef.handleFrame({
                     sid: 0, status: SESS_NEW, option: OPT_DATA,
@@ -1073,28 +1074,24 @@ export default {
                   });
                 }
                 const s = smRef.sessions.get(0);
-                if (s?.grain) { s.grain.send(c);  }
+                if (s?.grain) { s.grain.send(c); }
                 return;
               }
               uploadBuffer = c;
               return;
             }
-            
             await smRef.handleFrame(frame);
             c = c.subarray(frame.frameEnd);
           }
           if (c.length > 0) {
-            
             uploadBuffer = c;
           }
         };
 
         ctx.waitUntil((async () => {
           try {
-            
             udpPool = await createTURNUDPPool(turnCfg, env);
             if (!udpPool) {
-              
               controller.error(new Error('TURN UDP pool init failed'));
               return;
             }
@@ -1102,15 +1099,12 @@ export default {
             sm = createSessionManager(controller, turnCfg, env, udpPool, isStreamOne);
 
             udpPool.setUDPHandler((ip, port, data) => {
-              
               for (const [sid, us] of sm.udpMap) {
                 if (us.ip === ip && us.port === port) {
-                  
                   sm.downWrite(sid, xudpResp(us.host, us.port, data));
                   return;
                 }
               }
-              
               sm.downWrite(0, xudpResp(ip, port, data));
             });
 
@@ -1118,14 +1112,13 @@ export default {
 
             for (;;) {
               const { done, value } = await reader.read();
-              if (done) {  break; }
+              if (done) { break; }
               if (value) {
                 const chunk = toU8(value);
                 if (chunk.byteLength) await processFrames(chunk, sm, vlessTarget);
               }
             }
-          } catch (e) {  } finally {
-            
+          } catch (e) {} finally {
             try { reader.releaseLock(); } catch {}
             sm?.closeAll();
             udpPool?.close();
